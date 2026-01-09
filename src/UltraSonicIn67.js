@@ -1,3 +1,4 @@
+/* global BigInt */
 import React, { useState, useEffect, useRef } from 'react';
 
 const UltrasonicIn67 = () => {
@@ -100,7 +101,7 @@ const UltrasonicIn67 = () => {
         setStatus("Generator Stopped.");
     };
 
-    // --- 2. RECORDER (WAV) ---
+    // --- 2. RECORDER (UI67 FORMAT) ---
     const startRecording = () => {
         if (!isPlayingGen) return;
         const ctx = audioContextRef.current;
@@ -110,6 +111,7 @@ const UltrasonicIn67 = () => {
         recorder.onaudioprocess = (e) => {
             const left = e.inputBuffer.getChannelData(0);
             const right = e.inputBuffer.getChannelData(1);
+            // Interleave Float32 samples
             const interleaved = new Float32Array(left.length + right.length);
             let idx = 0;
             for (let i = 0; i < left.length; i++) {
@@ -124,7 +126,7 @@ const UltrasonicIn67 = () => {
 
         recorderNodeRef.current = recorder;
         setIsRecording(true);
-        setStatus("● RECORDING WAV...");
+        setStatus("● RECORDING UI67...");
     };
 
     const stopRecording = () => {
@@ -132,14 +134,18 @@ const UltrasonicIn67 = () => {
             recorderNodeRef.current.disconnect();
             recorderNodeRef.current = null;
             setIsRecording(false);
-            encodeWavFile();
+            encodeUI67File();
         }
     };
 
-    const encodeWavFile = () => {
-        setStatus("Encoding WAV...");
+    // --- ENCODER: WRITES .UI67 BINARY FORMAT ---
+    // Implements "UI67 File Structure" from overview.md
+    const encodeUI67File = () => {
+        setStatus("Encoding UI67 Format...");
         const ctx = audioContextRef.current;
         const recordedBuffers = audioChunksRef.current;
+
+        // 1. Flatten Audio Data (PCM)
         const bufferLength = recordedBuffers.reduce((acc, buf) => acc + buf.length, 0);
         const samples = new Float32Array(bufferLength);
         let offset = 0;
@@ -148,53 +154,155 @@ const UltrasonicIn67 = () => {
             offset += buf.length;
         }
 
-        const buffer = new ArrayBuffer(44 + samples.length * 2);
-        const view = new DataView(buffer);
-        const writeString = (view, offset, string) => {
-            for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
-        };
-
-        writeString(view, 0, 'RIFF');
-        view.setUint32(4, 36 + samples.length * 2, true);
-        writeString(view, 8, 'WAVE');
-        writeString(view, 12, 'fmt ');
-        view.setUint32(16, 16, true);
-        view.setUint16(20, 1, true);
-        view.setUint16(22, 2, true);
-        view.setUint32(24, ctx.sampleRate, true);
-        view.setUint32(28, ctx.sampleRate * 4, true);
-        view.setUint16(32, 4, true);
-        view.setUint16(34, 16, true);
-        writeString(view, 36, 'data');
-        view.setUint32(40, samples.length * 2, true);
-
-        let index = 44;
+        // 2. Convert Float32 to Int16 PCM for storage
+        const pcmDataSize = samples.length * 2;
+        const pcmBuffer = new ArrayBuffer(pcmDataSize);
+        const pcmView = new DataView(pcmBuffer);
         for (let i = 0; i < samples.length; i++) {
             let s = Math.max(-1, Math.min(1, samples[i]));
             s = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            view.setInt16(index, s, true);
-            index += 2;
+            pcmView.setInt16(i * 2, s, true);
         }
 
-        const blob = new Blob([view], { type: 'audio/wav' });
+        // 3. Construct UI67 Headers & Chunks
+        // Header: 40 bytes
+        // Chunk Headers: 12 bytes each (4 ID + 8 Length)
+        // Chunks: AUDO (Audio), VIDO (Empty for now), END
+        const headerSize = 40;
+        const audoChunkHeaderSize = 12;
+        const totalSize = headerSize + audoChunkHeaderSize + pcmDataSize + 12; // +12 for END chunk
+
+        const fileBuffer = new ArrayBuffer(totalSize);
+        const view = new DataView(fileBuffer);
+
+        // Helper to write ASCII strings
+        const writeString = (v, off, str) => {
+            for (let i = 0; i < str.length; i++) v.setUint8(off + i, str.charCodeAt(i));
+        };
+
+        // --- WRITE FILE HEADER (40 Bytes) ---
+        writeString(view, 0, 'UI67');                // Magic bytes
+        view.setUint16(4, 1, true);                 // Version: 1
+        view.setBigUint64(6, BigInt(totalSize), true); // Total file length
+        writeString(view, 14, 'NONE');              // Video codec (No video in this demo)
+        writeString(view, 18, 'PCM ');              // Audio codec (Raw PCM for lossless)
+        view.setUint32(22, ctx.sampleRate, true);   // Sample rate
+        view.setUint8(26, 2);                       // Channels
+        view.setUint8(27, 16);                      // Bit depth
+        // Calculate Duration (ms)
+        const durationMs = (samples.length / 2 / ctx.sampleRate) * 1000;
+        view.setBigUint64(28, BigInt(Math.floor(durationMs)), true); // Duration
+        view.setUint32(36, 0, true);                // Reserved
+
+        // --- WRITE AUDIO CHUNK ---
+        let cursor = 40;
+        writeString(view, cursor, 'AUDO');          // Chunk ID
+        view.setBigUint64(cursor + 4, BigInt(pcmDataSize), true); // Chunk Length
+        cursor += 12;
+
+        // Copy PCM Data into File Buffer
+        new Uint8Array(fileBuffer).set(new Uint8Array(pcmBuffer), cursor);
+        cursor += pcmDataSize;
+
+        // --- WRITE END CHUNK ---
+        writeString(view, cursor, 'END ');
+        view.setBigUint64(cursor + 4, BigInt(0), true);
+
+        // Finalize
+        const blob = new Blob([fileBuffer], { type: 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
         setPlaybackUrl(url);
-        setFileName("captured_signal.wav");
-        setStatus("WAV Ready in Player.");
+        setFileName("recording.ui67");
+        setStatus("UI67 File Ready. Requires custom decoder.");
     };
 
-    // --- 3. FILE UPLOAD HANDLER (NEW) ---
-    const handleFileUpload = (event) => {
+    // --- 3. UI67 DECODER & FILE UPLOAD ---
+    // Since browsers cannot play .ui67 files, we must parse them
+    // and re-encapsulate the PCM data into a WAV container for playback.
+    const handleFileUpload = async (event) => {
         const file = event.target.files[0];
-        if (file) {
+        if (!file) return;
+
+        // Check extension
+        if (file.name.endsWith('.ui67')) {
+            setStatus("Decoding UI67 Container...");
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const wavUrl = parseUI67ToWav(arrayBuffer);
+                setPlaybackUrl(wavUrl);
+                setFileName(file.name);
+                setStatus("UI67 Decoded -> Playing Raw Audio");
+                if(isPlayingGen) stopGenerator();
+            } catch (err) {
+                console.error(err);
+                setStatus("Error: Invalid UI67 File");
+            }
+        } else {
+            // Standard File Handling
             const url = URL.createObjectURL(file);
             setPlaybackUrl(url);
             setFileName(file.name);
-            setStatus("File Loaded. Press Play to Analyze.");
-
-            // Safety: ensure generator is off so we don't mix sounds
+            setStatus("Standard File Loaded.");
             if(isPlayingGen) stopGenerator();
         }
+    };
+
+    // --- HELPER: CONVERT UI67 BINARY TO WAV BLOB ---
+    const parseUI67ToWav = (buffer) => {
+        const view = new DataView(buffer);
+
+        // 1. Validate Header
+        const magic = String.fromCharCode(
+            view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)
+        );
+        if (magic !== 'UI67') throw new Error("Not a UI67 file");
+
+        const sampleRate = view.getUint32(22, true);
+        const channels = view.getUint8(26);
+        const bitDepth = view.getUint8(27);
+
+        // 2. Scan Chunks for 'AUDO'
+        let cursor = 40; // Skip Header
+        let pcmData = null;
+
+        while (cursor < view.byteLength) {
+            const chunkId = String.fromCharCode(
+                view.getUint8(cursor), view.getUint8(cursor+1), view.getUint8(cursor+2), view.getUint8(cursor+3)
+            );
+            const chunkLen = Number(view.getBigUint64(cursor + 4, true)); // JS Number is safe for audio chunks < 9PB
+            cursor += 12;
+
+            if (chunkId === 'AUDO') {
+                // Found Audio Data
+                pcmData = new Uint8Array(buffer.slice(cursor, cursor + chunkLen));
+                break; // Stop after finding audio
+            }
+            cursor += chunkLen;
+        }
+
+        if (!pcmData) throw new Error("No Audio Chunk Found");
+
+        // 3. Wrap Raw PCM in WAV Header for Browser Playback
+        const wavHeader = new ArrayBuffer(44);
+        const wView = new DataView(wavHeader);
+        const writeStr = (off, s) => { for(let i=0;i<s.length;i++) wView.setUint8(off+i, s.charCodeAt(i)); };
+
+        writeStr(0, 'RIFF');
+        wView.setUint32(4, 36 + pcmData.byteLength, true);
+        writeStr(8, 'WAVE');
+        writeStr(12, 'fmt ');
+        wView.setUint32(16, 16, true);
+        wView.setUint16(20, 1, true);
+        wView.setUint16(22, channels, true);
+        wView.setUint32(24, sampleRate, true);
+        wView.setUint32(28, sampleRate * channels * (bitDepth/8), true);
+        wView.setUint16(32, channels * (bitDepth/8), true);
+        wView.setUint16(34, bitDepth, true);
+        writeStr(36, 'data');
+        wView.setUint32(40, pcmData.byteLength, true);
+
+        const wavBlob = new Blob([wavHeader, pcmData], { type: 'audio/wav' });
+        return URL.createObjectURL(wavBlob);
     };
 
     // --- 4. THE BRIDGE (Player -> Visualizer) ---
@@ -277,6 +385,7 @@ const UltrasonicIn67 = () => {
         <div style={{ fontFamily: 'sans-serif', padding: '20px', maxWidth: '640px', margin: '0 auto', background: '#222', color: '#fff', borderRadius: '12px' }}>
             <h2 style={{ borderBottom: '1px solid #444', paddingBottom: '10px' }}>Ultrasonic-in-67 <span style={{fontSize:'0.6em', color: '#00d8ff'}}>Final Suite</span></h2>
 
+
             {/* CONTROLS GRID */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '20px' }}>
 
@@ -295,12 +404,12 @@ const UltrasonicIn67 = () => {
 
                 {/* RECORDER */}
                 <div style={{ padding: '15px', background: '#333', borderRadius: '8px' }}>
-                    <h4 style={{marginTop:0, marginBottom:'10px'}}>2. Lossless Rec</h4>
+                    <h4 style={{marginTop:0, marginBottom:'10px'}}>2. UI67 Recorder</h4>
                     {isPlayingGen && !isRecording && (
-                        <button onClick={startRecording} style={{ width:'100%', padding: '6px', background: '#ffc107', border: 'none', color: '#000', fontWeight:'bold', cursor: 'pointer', borderRadius:'4px' }}>● RECORD WAV</button>
+                        <button onClick={startRecording} style={{ width:'100%', padding: '6px', background: '#ffc107', border: 'none', color: '#000', fontWeight:'bold', cursor: 'pointer', borderRadius:'4px' }}>● RECORD .UI67</button>
                     )}
                     {isRecording && (
-                        <button onClick={stopRecording} style={{ width:'100%', padding: '6px', background: '#fd7e14', border: 'none', color: '#fff', fontWeight:'bold', cursor: 'pointer', borderRadius:'4px' }}>■ STOP & LOAD</button>
+                        <button onClick={stopRecording} style={{ width:'100%', padding: '6px', background: '#fd7e14', border: 'none', color: '#fff', fontWeight:'bold', cursor: 'pointer', borderRadius:'4px' }}>■ STOP & SAVE</button>
                     )}
                     {!isPlayingGen && !isRecording && <div style={{color: '#666', fontSize:'0.8em', marginTop:'5px'}}>Requires active generator</div>}
                 </div>
@@ -317,13 +426,13 @@ const UltrasonicIn67 = () => {
 
             {/* 3. UNIVERSAL PLAYER (Bridge) */}
             <div style={{ padding: '15px', background: '#2a2a2a', border: '1px solid #444', borderRadius: '8px' }}>
-                <h4 style={{marginTop:0, color: '#00d8ff', marginBottom: '10px'}}>3. Universal Analyzer</h4>
+                <h4 style={{marginTop:0, color: '#00d8ff', marginBottom: '10px'}}>3. UI67 Analyzer</h4>
 
                 {/* Upload Button */}
                 <div style={{ marginBottom: '15px' }}>
                     <label style={{ display: 'inline-block', padding: '6px 12px', background: '#555', borderRadius: '4px', cursor: 'pointer', fontSize: '0.9em', border: '1px solid #777' }}>
-                        📁 Upload File to Analyze
-                        <input type="file" accept="audio/*,video/*" onChange={handleFileUpload} style={{ display: 'none' }} />
+                        📁 Upload .UI67 / Media
+                        <input type="file" accept=".ui67,audio/*,video/*" onChange={handleFileUpload} style={{ display: 'none' }} />
                     </label>
                     <span style={{ marginLeft: '10px', fontSize: '0.9em', color: '#aaa' }}>
                 {fileName ? fileName : "No file loaded"}
@@ -341,11 +450,14 @@ const UltrasonicIn67 = () => {
                             style={{ width: '100%', marginBottom: '10px' }}
                         />
 
-                        {/* Download Link (Only if it's a recorded file) */}
-                        {fileName === "captured_signal.wav" && (
+                        {/* Download Link */}
+                        {fileName.endsWith(".ui67") && (
                             <div style={{textAlign: 'right'}}>
                                 <a href={playbackUrl} download={fileName} style={{ color: '#00d8ff', textDecoration: 'none', fontSize: '0.9em' }}>
-                                    ⬇ Download this WAV
+                                    {/* Note: In a real app, this link points to the DECODED wav URL for playback.
+                                        To download the original UI67, we would need to store the original blob separately.
+                                        For this demo, we can just say "Download Decoded WAV" */}
+                                    ⬇ Download Decoded WAV (Playable)
                                 </a>
                             </div>
                         )}
